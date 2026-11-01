@@ -1,0 +1,285 @@
+name: Auto build upstream
+
+# Para ponerlo en TU fork de heydemoura/EglantinePS5, en la ruta:
+#   .github/workflows/auto-build.yml
+#
+# Qué hace:
+#   1. Cada 6 horas (y cuando lo lances a mano) COMPRUEBA, sin compilar nada, si el repositorio
+#      original tiene un commit nuevo en main o un pull request abierto con commits nuevos.
+#      Esta comprobación dura segundos.
+#   2. Solo si hay algo que no se ha compilado ya, descarga ESE código del repositorio original
+#      y lo compila con los mismos pasos que su release.yml.
+#   3. Publica el ZIP como pre-release en tu fork (pestaña Releases), con la etiqueta
+#      auto-main-<commit> o auto-pr<número>-<commit>. Esa etiqueta es lo que recuerda qué
+#      commits ya están compilados, así que el mismo commit nunca se compila dos veces.
+#
+# Se compila UN objetivo por ejecución (primero main, luego los PR). Si hay varios pendientes,
+# se van procesando en las siguientes ejecuciones, o lanzando "Run workflow" otra vez.
+#
+# Este archivo es una copia adaptada del release.yml del original. Si el original cambia sus
+# pasos de compilación (paquetes, herramientas), esta copia hay que actualizarla.
+on:
+  schedule:
+    - cron: '23 */6 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Nunca dos compilaciones a la vez; una ejecución nueva espera a que acabe la actual.
+concurrency:
+  group: auto-build
+  cancel-in-progress: false
+
+env:
+  UPSTREAM: heydemoura/EglantinePS5
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    outputs:
+      build: ${{ steps.pick.outputs.build }}
+      label: ${{ steps.pick.outputs.label }}
+      ref: ${{ steps.pick.outputs.ref }}
+      sha: ${{ steps.pick.outputs.sha }}
+      tag: ${{ steps.pick.outputs.tag }}
+    steps:
+      - name: Look for something new upstream
+        id: pick
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          main_sha=$(gh api "repos/$UPSTREAM/commits/main" --jq .sha)
+          candidates=$(printf 'main|refs/heads/main|%s\n' "$main_sha")
+          prs=$(gh api "repos/$UPSTREAM/pulls?state=open&per_page=100" \
+            --jq '.[] | "pr\(.number)|refs/pull/\(.number)/head|\(.head.sha)"')
+          if [ -n "$prs" ]; then
+            candidates+=$'\n'"$prs"
+          fi
+
+          found=false
+          while IFS='|' read -r label ref sha; do
+            [ -n "$label" ] || continue
+            tag="auto-${label}-${sha:0:7}"
+            if gh api "repos/$GITHUB_REPOSITORY/releases/tags/$tag" > /dev/null 2>&1; then
+              echo "Ya compilado: $tag"
+              continue
+            fi
+            echo "Pendiente de compilar: $tag ($ref)"
+            {
+              echo "label=$label"
+              echo "ref=$ref"
+              echo "sha=$sha"
+              echo "tag=$tag"
+            } >> "$GITHUB_OUTPUT"
+            found=true
+            break
+          done <<< "$candidates"
+
+          echo "build=$found" >> "$GITHUB_OUTPUT"
+          if [ "$found" = false ]; then
+            echo "::notice title=Nada nuevo::No hay commits ni PR sin compilar."
+          fi
+
+  build:
+    needs: check
+    if: needs.check.outputs.build == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 355
+    # Solo lectura: este job ejecuta codigo ajeno (el del original o de un PR). La escritura
+    # del release se hace en otro job, que no ejecuta ese codigo.
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: bash
+    env:
+      CCACHE_MAXSIZE: 4G
+    steps:
+      - name: Free disk space
+        run: |
+          df -h "$GITHUB_WORKSPACE"
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup \
+            /usr/local/share/boost /opt/hostedtoolcache/CodeQL /opt/hostedtoolcache/go \
+            /opt/hostedtoolcache/Java_Temurin-Hotspot_jdk /opt/hostedtoolcache/PyPy \
+            /opt/hostedtoolcache/Ruby
+          df -h "$GITHUB_WORKSPACE"
+
+      # Diferencia principal con el original: se descarga el codigo del repositorio ORIGINAL,
+      # no el del fork.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ env.UPSTREAM }}
+          ref: ${{ needs.check.outputs.ref }}
+          submodules: true
+          persist-credentials: false
+
+      - name: Record what was checked out
+        run: |
+          {
+            echo "### Codigo compilado"
+            echo "- Repositorio: $UPSTREAM"
+            echo "- Referencia: ${{ needs.check.outputs.ref }}"
+            echo "- Commit: $(git rev-parse HEAD)"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Locate the caches
+        run: |
+          cache_root=$(dirname "$GITHUB_WORKSPACE")/ci-cache
+          mkdir -p "$cache_root"
+          {
+            echo "CACHE_ROOT=$cache_root"
+            echo "RADV_NATIVE=$(dirname "$GITHUB_WORKSPACE")/mihawk-vulkan-review/.deps/native"
+            echo "EGLANTINEPS5_DEPS_CACHE=$cache_root/downloads"
+            echo "CCACHE_DIR=$cache_root/ccache"
+            echo "XDG_CACHE_HOME=$cache_root/xdg"
+            echo "JOBS=$(nproc)"
+            echo "RADV_BUILD_JOBS=$(nproc)"
+            echo "SPIRV_TRANSLATOR=$cache_root/spirv-llvm-translator"
+          } >> "$GITHUB_ENV"
+
+      - name: Restore the SPIR-V LLVM translator
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
+        with:
+          path: ${{ env.SPIRV_TRANSLATOR }}
+          key: spirv-llvm-translator-${{ hashFiles('tools/ci/setup-ubuntu-24.04.sh', 'tools/ci/ubuntu-24.04-packages.txt') }}
+
+      - name: Install the build tools (tools/ci/setup-ubuntu-24.04.sh)
+        run: |
+          bash tools/ci/setup-ubuntu-24.04.sh "$SPIRV_TRANSLATOR" 3>> "$GITHUB_ENV"
+          make toolchain
+
+      - name: Restore downloads
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
+        with:
+          path: ${{ env.CACHE_ROOT }}/downloads
+          key: downloads-${{ hashFiles('tools/deps.json') }}
+
+      - name: Fetch dependencies
+        run: make deps
+
+      - name: Restore the RADV driver
+        id: radv
+        uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5
+        with:
+          path: |
+            ${{ env.RADV_NATIVE }}/radv-release
+            ${{ env.RADV_NATIVE }}/ps5-payload-sdk
+            ${{ env.RADV_NATIVE }}/zlib
+            build/radv-isolated
+          key: radv-3-${{ hashFiles('tools/deps.json', 'tools/patch-radv-wsi.py', 'tools/build-radv-dependencies.sh', 'tools/isolate-radv.py', 'tools/ci/ubuntu-24.04-packages.txt', 'tools/ci/setup-ubuntu-24.04.sh') }}
+
+      - name: Restore ccache
+        id: ccache
+        uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5
+        with:
+          path: ${{ env.CACHE_ROOT }}/ccache
+          key: ccache-u24-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: ccache-u24-
+
+      # Sin ccache propio, se intenta el snapshot del repositorio ORIGINAL (en el original esta
+      # URL apuntaba a su propio repo; en un fork ese release no existe). Si no se encuentra,
+      # el build compila todo desde cero (en torno a una hora segun la documentacion).
+      - name: Fetch the ccache snapshot
+        if: steps.ccache.outputs.cache-matched-key == ''
+        run: |
+          url="$GITHUB_SERVER_URL/$UPSTREAM/releases/download/build-cache/ccache-u24.tar"
+          if curl -fsSL --retry 3 -o "$RUNNER_TEMP/ccache-u24.tar" "$url"; then
+            mkdir -p "$CCACHE_DIR"
+            tar -xf "$RUNNER_TEMP/ccache-u24.tar" -C "$CCACHE_DIR"
+            rm "$RUNNER_TEMP/ccache-u24.tar"
+            echo "::notice title=ccache::Started from the build-cache snapshot ($(du -sh "$CCACHE_DIR" | cut -f1))."
+          else
+            echo "::notice title=ccache::No snapshot to start from; this run compiles everything."
+          fi
+
+      - name: Build and package
+        id: build
+        timeout-minutes: 315
+        run: |
+          ccache --zero-stats
+          bash tools/ci/build-release.sh
+
+      - name: Report disk, ccache and the linker
+        if: always()
+        run: |
+          df -h "$GITHUB_WORKSPACE"
+          ccache --show-stats || true
+
+      - name: Save ccache
+        if: always()
+        uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25 # v5
+        with:
+          path: ${{ env.CACHE_ROOT }}/ccache
+          key: ccache-u24-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - name: Save the RADV driver
+        if: always() && steps.radv.outputs.cache-hit != 'true' && hashFiles('build/radv-isolated/libvulkan_radeon.ps5.a') != ''
+        uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25 # v5
+        with:
+          path: |
+            ${{ env.RADV_NATIVE }}/radv-release
+            ${{ env.RADV_NATIVE }}/ps5-payload-sdk
+            ${{ env.RADV_NATIVE }}/zlib
+            build/radv-isolated
+          key: radv-3-${{ hashFiles('tools/deps.json', 'tools/patch-radv-wsi.py', 'tools/build-radv-dependencies.sh', 'tools/isolate-radv.py', 'tools/ci/ubuntu-24.04-packages.txt', 'tools/ci/setup-ubuntu-24.04.sh') }}
+
+      - name: Check the ZIP and its checksum
+        run: |
+          set -euo pipefail
+          cd dist
+          python3 - EglantinePS5-v*.zip <<'PY'
+          import json, sys, zipfile
+          assert len(sys.argv) == 2, f"expected one ZIP: {sys.argv[1:]}"
+          archive = sys.argv[1]
+          with zipfile.ZipFile(archive) as z:
+              assert z.testzip() is None, "damaged entry"
+              names = z.namelist()
+              assert "PPSA98515/eboot.bin" in names, "no eboot.bin"
+              wrong = [i.filename for i in z.infolist() if (i.external_attr >> 16) & 0o777 != 0o777]
+              assert not wrong, f"entries not stored as 0777: {wrong[:3]}"
+              version = json.loads(z.read("PPSA98515/sce_sys/param.json"))["contentVersion"]
+              assert archive == f"EglantinePS5-v{version.removeprefix('0')}.zip", (archive, version)
+              print(f"{archive}: {len(names)} entries, all 0777, version {version}")
+          PY
+          sha256sum -c SHA256SUMS
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ needs.check.outputs.tag }}
+          path: dist/
+          if-no-files-found: error
+          retention-days: 7
+
+      # Simbolos para leer crash reports (tools/symbolize-crash.py). No van al release.
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ needs.check.outputs.tag }}-symbols
+          path: build/symbols/
+          retention-days: 14
+
+  publish:
+    needs: [check, build]
+    if: needs.build.result == 'success'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: ${{ needs.check.outputs.tag }}
+          path: dist
+
+      - name: Publish the pre-release in this fork
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.check.outputs.tag }}
+          REF: ${{ needs.check.outputs.ref }}
+          SHA: ${{ needs.check.outputs.sha }}
+        run: |
+          set -euo pipefail
+          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --prerelease \
+            --title "$TAG" \
+            --notes "Compilacion automatica y SIN REVISAR de $UPSTREAM ($REF, commit $SHA). Lee los cambios antes de instalarla en la consola." \
+            dist/EglantinePS5-v*.zip dist/SHA256SUMS
