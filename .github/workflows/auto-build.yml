@@ -22,6 +22,12 @@ on:
   schedule:
     - cron: '23 */6 * * *'
   workflow_dispatch:
+    inputs:
+      branch:
+        description: "Rama del repositorio original a compilar (vacio = main y los PR abiertos)"
+        required: false
+        default: ''
+        type: string
 
 permissions:
   contents: read
@@ -48,14 +54,22 @@ jobs:
         id: pick
         env:
           GH_TOKEN: ${{ github.token }}
+          BRANCH: ${{ inputs.branch }}
         run: |
           set -euo pipefail
-          main_sha=$(gh api "repos/$UPSTREAM/commits/main" --jq .sha)
-          candidates=$(printf 'main|refs/heads/main|%s\n' "$main_sha")
-          prs=$(gh api "repos/$UPSTREAM/pulls?state=open&per_page=100" \
-            --jq '.[] | "pr\(.number)|refs/pull/\(.number)/head|\(.head.sha)"')
-          if [ -n "$prs" ]; then
-            candidates+=$'\n'"$prs"
+          if [ -n "${BRANCH:-}" ]; then
+            # Lanzamiento manual con una rama concreta del original.
+            sha=$(gh api "repos/$UPSTREAM/commits/$BRANCH" --jq .sha)
+            safe=$(printf '%s' "$BRANCH" | tr -c 'A-Za-z0-9._-' '-')
+            candidates=$(printf 'branch-%s|refs/heads/%s|%s\n' "$safe" "$BRANCH" "$sha")
+          else
+            main_sha=$(gh api "repos/$UPSTREAM/commits/main" --jq .sha)
+            candidates=$(printf 'main|refs/heads/main|%s\n' "$main_sha")
+            prs=$(gh api "repos/$UPSTREAM/pulls?state=open&per_page=100" \
+              --jq '.[] | "pr\(.number)|refs/pull/\(.number)/head|\(.head.sha)"')
+            if [ -n "$prs" ]; then
+              candidates+=$'\n'"$prs"
+            fi
           fi
 
           found=false
