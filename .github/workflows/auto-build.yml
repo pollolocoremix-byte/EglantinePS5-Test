@@ -5,16 +5,15 @@ name: Auto build upstream
 #
 # Qué hace:
 #   1. Cada 6 horas (y cuando lo lances a mano) COMPRUEBA, sin compilar nada, si el repositorio
-#      original tiene un commit nuevo en main o un pull request abierto con commits nuevos.
-#      Esta comprobación dura segundos.
+#      original tiene un commit nuevo en main. Esta comprobación dura segundos.
+#      Los PR y las ramas NO se compilan solos: se piden a mano con los campos "pr" o "branch".
 #   2. Solo si hay algo que no se ha compilado ya, descarga ESE código del repositorio original
 #      y lo compila con los mismos pasos que su release.yml.
 #   3. Publica el ZIP como pre-release en tu fork (pestaña Releases), con la etiqueta
 #      auto-main-<commit> o auto-pr<número>-<commit>. Esa etiqueta es lo que recuerda qué
 #      commits ya están compilados, así que el mismo commit nunca se compila dos veces.
 #
-# Se compila UN objetivo por ejecución (primero main, luego los PR). Si hay varios pendientes,
-# se van procesando en las siguientes ejecuciones, o lanzando "Run workflow" otra vez.
+# Se compila UN objetivo por ejecución.
 #
 # Este archivo es una copia adaptada del release.yml del original. Si el original cambia sus
 # pasos de compilación (paquetes, herramientas), esta copia hay que actualizarla.
@@ -24,7 +23,12 @@ on:
   workflow_dispatch:
     inputs:
       branch:
-        description: "Rama del repositorio original a compilar (vacio = main y los PR abiertos)"
+        description: "Opcional: rama del original a compilar tal cual (ej. fix/bananza-startup-and-terrain)"
+        required: false
+        default: ''
+        type: string
+      pr:
+        description: "Opcional: numero de un PR del original, compilado FUSIONADO con main (ej. 2)"
         required: false
         default: ''
         type: string
@@ -55,6 +59,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           BRANCH: ${{ inputs.branch }}
+          PR: ${{ inputs.pr }}
         run: |
           set -euo pipefail
           if [ -n "${BRANCH:-}" ]; then
@@ -62,26 +67,28 @@ jobs:
             sha=$(gh api "repos/$UPSTREAM/commits/$BRANCH" --jq .sha)
             safe=$(printf '%s' "$BRANCH" | tr -c 'A-Za-z0-9._-' '-')
             candidates=$(printf 'branch-%s|refs/heads/%s|%s\n' "$safe" "$BRANCH" "$sha")
+          elif [ -n "${PR:-}" ]; then
+            # Lanzamiento manual con un PR concreto, fusionado con main (refs/pull/N/merge).
+            if ! [[ "$PR" =~ ^[0-9]+$ ]]; then
+              echo "::error title=Campo pr no valido::Escribe solo el numero del PR, por ejemplo 2."
+              exit 1
+            fi
+            for try in 1 2 3; do
+              info=$(gh api "repos/$UPSTREAM/pulls/$PR" --jq '"\(.mergeable)|\(.merge_commit_sha // "")"')
+              [ "${info%%|*}" != "null" ] && break
+              sleep 5   # GitHub calcula la fusion bajo demanda; la primera lectura puede ser null
+            done
+            mergeable=${info%%|*}
+            msha=${info#*|}
+            if [ "$mergeable" != "true" ] || [ -z "$msha" ]; then
+              echo "::error title=PR #$PR no compilable::mergeable=$mergeable. Si tiene conflicto con main, compila su rama con el campo branch."
+              exit 1
+            fi
+            candidates=$(printf 'pr%s|refs/pull/%s/merge|%s\n' "$PR" "$PR" "$msha")
           else
+            # Automatico (horario): SOLO main. Los PR y las ramas se compilan a mano.
             main_sha=$(gh api "repos/$UPSTREAM/commits/main" --jq .sha)
             candidates=$(printf 'main|refs/heads/main|%s\n' "$main_sha")
-            # Los PR se compilan FUSIONADOS con main (refs/pull/N/merge), como hace el
-            # release.yml original, para que incluyan lo que ya se haya fusionado en main.
-            # Si un PR tiene conflictos con main, se omite y se avisa en el log.
-            for n in $(gh api "repos/$UPSTREAM/pulls?state=open&per_page=100" --jq '.[].number'); do
-              for try in 1 2 3; do
-                info=$(gh api "repos/$UPSTREAM/pulls/$n" --jq '"\(.mergeable)|\(.merge_commit_sha // "")"')
-                [ "${info%%|*}" != "null" ] && break
-                sleep 5   # GitHub calcula la fusion bajo demanda; la primera lectura puede ser null
-              done
-              mergeable=${info%%|*}
-              msha=${info#*|}
-              if [ "$mergeable" = "true" ] && [ -n "$msha" ]; then
-                candidates+=$'\n'"pr${n}|refs/pull/${n}/merge|${msha}"
-              else
-                echo "::warning title=PR #$n omitido::mergeable=$mergeable (conflicto con main, o GitHub aun lo calcula). Se reintentara en la siguiente ejecucion."
-              fi
-            done
           fi
 
           found=false
