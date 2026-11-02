@@ -65,11 +65,23 @@ jobs:
           else
             main_sha=$(gh api "repos/$UPSTREAM/commits/main" --jq .sha)
             candidates=$(printf 'main|refs/heads/main|%s\n' "$main_sha")
-            prs=$(gh api "repos/$UPSTREAM/pulls?state=open&per_page=100" \
-              --jq '.[] | "pr\(.number)|refs/pull/\(.number)/head|\(.head.sha)"')
-            if [ -n "$prs" ]; then
-              candidates+=$'\n'"$prs"
-            fi
+            # Los PR se compilan FUSIONADOS con main (refs/pull/N/merge), como hace el
+            # release.yml original, para que incluyan lo que ya se haya fusionado en main.
+            # Si un PR tiene conflictos con main, se omite y se avisa en el log.
+            for n in $(gh api "repos/$UPSTREAM/pulls?state=open&per_page=100" --jq '.[].number'); do
+              for try in 1 2 3; do
+                info=$(gh api "repos/$UPSTREAM/pulls/$n" --jq '"\(.mergeable)|\(.merge_commit_sha // "")"')
+                [ "${info%%|*}" != "null" ] && break
+                sleep 5   # GitHub calcula la fusion bajo demanda; la primera lectura puede ser null
+              done
+              mergeable=${info%%|*}
+              msha=${info#*|}
+              if [ "$mergeable" = "true" ] && [ -n "$msha" ]; then
+                candidates+=$'\n'"pr${n}|refs/pull/${n}/merge|${msha}"
+              else
+                echo "::warning title=PR #$n omitido::mergeable=$mergeable (conflicto con main, o GitHub aun lo calcula). Se reintentara en la siguiente ejecucion."
+              fi
+            done
           fi
 
           found=false
